@@ -1,0 +1,164 @@
+name: CiderPress iOS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      xcode_path:
+        description: "Xcode project or workspace path"
+        required: true
+        default: "iosApp/iosApp.xcodeproj"
+      scheme:
+        description: "Xcode scheme to archive"
+        required: true
+        default: "iosApp"
+      configuration:
+        description: "Xcode build configuration"
+        required: true
+        default: "Release"
+      export_method:
+        description: "Xcode export method: development, ad-hoc, or app-store-connect"
+        required: true
+        default: "development"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Build signed iOS IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Validate signing secrets
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          test -n "$BUILD_CERTIFICATE_BASE64"
+          test -n "$P12_PASSWORD"
+          test -n "$BUILD_PROVISION_PROFILE_BASE64"
+          test -n "$KEYCHAIN_PASSWORD"
+          test -n "$DEVELOPMENT_TEAM"
+
+      - name: Install Apple certificate and provisioning profile
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          PP_PATH="$RUNNER_TEMP/build_profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/ciderpress-signing.keychain-db"
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+          echo -n "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode -o "$PP_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PP_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles"
+
+      - name: Archive iOS app
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          PROVISIONING_PROFILE_SPECIFIER: ${{ secrets.PROVISIONING_PROFILE_SPECIFIER }}
+          XCODE_PATH: ${{ inputs.xcode_path }}
+          SCHEME: ${{ inputs.scheme }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          ARCHIVE_PATH="$RUNNER_TEMP/CiderPress.xcarchive"
+
+          if [[ "$XCODE_PATH" == *.xcworkspace ]]; then
+            XCODE_CONTAINER_FLAG="-workspace"
+          else
+            XCODE_CONTAINER_FLAG="-project"
+          fi
+
+          XCODE_ARGS=(
+            "$XCODE_CONTAINER_FLAG" "$XCODE_PATH"
+            -scheme "$SCHEME"
+            -configuration "$CONFIGURATION"
+            -destination "generic/platform=iOS"
+            -archivePath "$ARCHIVE_PATH"
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
+            CODE_SIGN_STYLE=Manual
+            clean archive
+          )
+
+          if [[ -n "$PROVISIONING_PROFILE_SPECIFIER" ]]; then
+            XCODE_ARGS+=(PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_SPECIFIER")
+          fi
+
+          xcodebuild "${XCODE_ARGS[@]}"
+
+      - name: Export IPA
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+        run: |
+          ARCHIVE_PATH="$RUNNER_TEMP/CiderPress.xcarchive"
+          EXPORT_PATH="$RUNNER_TEMP/ciderpress-export"
+          EXPORT_OPTIONS_PATH="$RUNNER_TEMP/ExportOptions.plist"
+
+          cat > "$EXPORT_OPTIONS_PATH" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>$EXPORT_METHOD</string>
+            <key>teamID</key>
+            <string>$DEVELOPMENT_TEAM</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>compileBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PATH" \
+            -exportPath "$EXPORT_PATH"
+
+          mkdir -p build/ciderpress/ios-ipa
+          IPA_PATH="$(find "$EXPORT_PATH" -name "*.ipa" -print -quit)"
+
+          if [[ -z "$IPA_PATH" ]]; then
+            echo "No IPA was exported."
+            exit 1
+          fi
+
+          cp "$IPA_PATH" build/ciderpress/ios-ipa/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-ipa
+          path: build/ciderpress/ios-ipa/*.ipa
+
+      - name: Clean up keychain
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/ciderpress-signing.keychain-db" || true
